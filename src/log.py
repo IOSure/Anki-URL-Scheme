@@ -1,3 +1,5 @@
-from ankiutils.log import get_logger
+import logging
 
-logger = get_logger(__name__)
+
+# Anki captures loggers with this prefix in a dedicated add-on log file.
+logger = logging.getLogger("addon.anki_links")

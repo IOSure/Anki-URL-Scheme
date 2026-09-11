@@ -2,6 +2,8 @@
 
 This Anki add-on adds a custom `anki://` URL handler to execute various commands inside Anki from your web browser or different apps. _Work in progress_.
 
+Tested with Anki 25.09.5 on Python 3.13 and Qt 6.9.1.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for a list of changes.

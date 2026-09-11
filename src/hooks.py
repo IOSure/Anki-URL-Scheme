@@ -1,96 +1,62 @@
 from __future__ import annotations
 
-import sys
-from typing import Any
-from urllib.parse import unquote
+from collections.abc import Callable
+from typing import Any, Optional
 
 from aqt import mw
-from aqt.qt import *
+from aqt.qt import QEvent, QFileOpenEvent, QObject
 
 from .handler import handle_url_protocol
+from .log import logger
+from .url_utils import normalize_anki_url
 
 
-class MonkeyPatch:
-    def __init__(self, og_onAppMsg: Callable[[str], None]) -> None:
-        self.og_onAppMsg = og_onAppMsg
+def _handle_anki_url(value: str) -> bool:
+    normalized = normalize_anki_url(value)
+    if normalized is None:
+        return False
 
-    def on_app_msg_wrapper_hk(self) -> Callable[[str], None]:
-        def normalize_anki_url(url: str) -> str:
-            """Normalize Anki URLs across all platforms"""
-            print(f"Normalizing URL: {url}")
-
-            anki_pos = url.find("anki:")
-            if anki_pos == -1:
-                return url
-
-            # Extract full path after anki: including the protocol
-            protocol_part = url[anki_pos:]
-            print(f"Protocol part: {protocol_part}")
-
-            # Handle different protocol variants
-            if protocol_part.startswith("anki://"):
-                path = protocol_part[7:]
-            elif protocol_part.startswith("anki:\\\\"):  # Windows double-escaped
-                path = protocol_part[8:]
-            elif protocol_part.startswith("anki:\\"):
-                path = protocol_part[6:]  # single escaped
-            elif protocol_part.startswith("anki:"):
-                path = protocol_part[5:].lstrip("/\\")
-            else:
-                return url
-
-            # Normalize path separators
-            path = path.replace("\\", "/")
-            path = unquote(path)
-
-            normalized = f"anki://{path}"
-            print(f"Normalized result: {normalized}")
-            assert "anki://" in normalized, "Missing protocol in normalized URL"
-
-            return normalized
-
-        def on_app_msg_hk(buf: str) -> None:
-            """Handle URL protocol across platforms"""
-            print(f"on_app_msg_hk: {buf}")
-            print(f"sys.argv: {sys.argv}")
-
-            # Handle both startup and runtime URLs
-            url_to_check = buf if buf else (sys.argv[1] if len(sys.argv) > 1 else None)
-
-            if url_to_check and "anki:" in url_to_check:
-                print(f"handling URL: {url_to_check}")
-                normalized_url = normalize_anki_url(url_to_check)
-                print(f"normalized URL: {normalized_url}")
-
-                if len(sys.argv) > 1:
-                    del sys.argv[1]
-
-                handle_url_protocol(normalized_url)
-                return None
-
-            return self.og_onAppMsg(buf)
-
-        return on_app_msg_hk
+    try:
+        handle_url_protocol(normalized)
+    except ValueError as exc:
+        logger.warning("Invalid anki:// URL %r: %s", value, exc)
+    return True
 
 
 class MacosUrlHandler(QObject):
     def eventFilter(self, obj: Any, event: QEvent) -> bool:
-        if event.type() == QEvent.Type.FileOpen:
-            assert isinstance(event, QFileOpenEvent)
-            url = event.url().toString()
-            print("Received URL:", url)
-            if url and "anki:" in url:
-                print(f"handling URL: {url}")
-                handle_url_protocol(url)
+        if event.type() == QEvent.Type.FileOpen and isinstance(
+            event, QFileOpenEvent
+        ):
+            url = event.url()
+            if url.isValid() and url.scheme().lower() == "anki":
+                _handle_anki_url(url.toString())
                 return True
 
         return super().eventFilter(obj, event)
 
 
+_macos_url_handler: Optional[MacosUrlHandler] = None
+
+
 def setup_app_hook() -> None:
-    monkeypatch = MonkeyPatch(mw.onAppMsg)
-    mw.app.appMsg.disconnect(mw.onAppMsg)
-    mw.onAppMsg = monkeypatch.on_app_msg_wrapper_hk()  # type: ignore
-    mw.app.appMsg.connect(mw.onAppMsg)
-    macos_url_handler = MacosUrlHandler(mw)
-    mw.app.installEventFilter(macos_url_handler)
+    global _macos_url_handler
+
+    original_on_app_msg: Callable[[str], None] = mw.onAppMsg
+    was_connected = True
+    try:
+        mw.app.appMsg.disconnect(original_on_app_msg)
+    except (TypeError, RuntimeError):
+        was_connected = False
+
+    def on_app_msg_hk(buf: str) -> None:
+        if _handle_anki_url(buf):
+            return
+        original_on_app_msg(buf)
+
+    mw.onAppMsg = on_app_msg_hk  # type: ignore[method-assign]
+    if was_connected:
+        mw.app.appMsg.connect(mw.onAppMsg)
+
+    _macos_url_handler = MacosUrlHandler(mw)
+    mw.app.installEventFilter(_macos_url_handler)

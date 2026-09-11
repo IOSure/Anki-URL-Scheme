@@ -1,3 +1,2 @@
-from ankiutils.config import Config
-
-config = Config(__name__)
+# This add-on currently has no configurable options.
+config: dict = {}

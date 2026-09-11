@@ -1,13 +1,18 @@
+import ctypes
+import json
 import os
+import plistlib
+import re
+import shutil
 import subprocess
 import sys
+from pathlib import Path
+from typing import Optional
 
 from anki.utils import is_lin, is_mac, is_win
 
 if is_win:
     import winreg
-
-from aqt.qt import *
 
 
 def register_protocol_handler_windows() -> None:
@@ -101,29 +106,168 @@ MimeType=x-scheme-handler/anki;"""
         print(f"Failed to register Linux protocol handler: {e}")
 
 
-def _register_protocol_handler_macos(bundle_id: str) -> None:
-    from Foundation import NSString
-    from LaunchServices import LSSetDefaultHandlerForURLScheme
+_MACOS_HELPER_BUNDLE_ID = "com.abdnh.anki-links.url-handler"
 
-    cf_scheme = NSString.stringWithString_("anki")
-    cf_bundle_id = NSString.stringWithString_(bundle_id)
-    result = LSSetDefaultHandlerForURLScheme(cf_scheme, cf_bundle_id)
+
+def _macos_anki_bundle_identifier() -> str:
+    env_bundle_id = os.environ.get("__CFBundleIdentifier")
+    if env_bundle_id:
+        return env_bundle_id
+
+    candidates = [
+        Path("/Applications/Anki.app/Contents/Info.plist"),
+        Path.home() / "Applications/Anki.app/Contents/Info.plist",
+    ]
+    for path in candidates:
+        try:
+            with path.open("rb") as file:
+                bundle_id = plistlib.load(file).get("CFBundleIdentifier")
+        except (OSError, plistlib.InvalidFileException):
+            continue
+        if bundle_id:
+            return bundle_id
+
+    # The current Anki launcher. Older releases used net.ankiweb.dtop.
+    return "net.ankiweb.launcher"
+
+
+def _set_macos_protocol_handler_legacy(bundle_id: Optional[str]) -> None:
+    core_services = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreServices.framework/CoreServices"
+    )
+    core_foundation = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+
+    create_cf_string = core_foundation.CFStringCreateWithCString
+    create_cf_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    create_cf_string.restype = ctypes.c_void_p
+
+    release = core_foundation.CFRelease
+    release.argtypes = [ctypes.c_void_p]
+    release.restype = None
+
+    set_handler = core_services.LSSetDefaultHandlerForURLScheme
+    set_handler.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    set_handler.restype = ctypes.c_int32
+
+    utf8_encoding = 0x08000100
+    scheme = create_cf_string(None, b"anki", utf8_encoding)
+    handler = create_cf_string(
+        None, (bundle_id or "").encode("utf-8"), utf8_encoding
+    )
+    if not scheme or not handler:
+        if scheme:
+            release(scheme)
+        if handler:
+            release(handler)
+        raise OSError("Failed to create macOS protocol handler strings")
+
+    try:
+        result = set_handler(scheme, handler)
+    finally:
+        release(handler)
+        release(scheme)
+
     if result != 0:
-        raise Exception("LSSetDefaultHandlerForURLScheme failed")
+        raise OSError(f"LSSetDefaultHandlerForURLScheme failed with status {result}")
+
+
+def _set_macos_protocol_handler(app_path: Path) -> None:
+    script = (
+        'ObjC.import("AppKit");'
+        f"const appURL = $.NSURL.fileURLWithPath({json.dumps(str(app_path))});"
+        "const error = $();"
+        "$.NSWorkspace.sharedWorkspace"
+        ".setDefaultApplicationAtURLToOpenURLsWithSchemeCompletionHandler("
+        'appURL, "anki", (err) => { error.assign(err); });'
+        "delay(2);"
+        "if (!error.isNil()) {"
+        " throw new Error(error.localizedDescription.js);"
+        "}"
+    )
+    try:
+        subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        _set_macos_protocol_handler_legacy(_MACOS_HELPER_BUNDLE_ID)
+
+
+def _macos_helper_app_path() -> Path:
+    return (
+        Path(__file__).resolve().parent
+        / "user_files"
+        / "Anki URL Handler.app"
+    )
+
+
+def _create_macos_helper_app(path: Path, anki_bundle_id: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", anki_bundle_id):
+        raise ValueError(f"Invalid Anki bundle identifier: {anki_bundle_id}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    script_path = path.parent / "Anki URL Handler.applescript"
+    open_location_handler = "\u00ab" + "event GURLGURL" + "\u00bb"
+    script = (
+        f"on {open_location_handler} theURL\n"
+        '  do shell script "/usr/bin/open -n -b " & quoted form of '
+        f'"{anki_bundle_id}" & " --args " & quoted form of theURL\n'
+        f"end {open_location_handler}\n"
+    )
+    script_path.write_text(script, encoding="utf-8")
+
+    if path.exists():
+        shutil.rmtree(path)
+    subprocess.run(
+        ["osacompile", "-o", str(path), str(script_path)],
+        check=True,
+    )
+
+    info_path = path / "Contents" / "Info.plist"
+    with info_path.open("rb") as file:
+        info = plistlib.load(file)
+    info.update(
+        {
+            "CFBundleDisplayName": "Anki URL Handler",
+            "CFBundleIdentifier": _MACOS_HELPER_BUNDLE_ID,
+            "CFBundleName": "Anki URL Handler",
+            "CFBundleShortVersionString": "1.0",
+            "CFBundleURLTypes": [
+                {
+                    "CFBundleURLName": "Anki Links",
+                    "CFBundleURLSchemes": ["anki"],
+                }
+            ],
+            "LSUIElement": True,
+        }
+    )
+    with info_path.open("wb") as file:
+        plistlib.dump(info, file)
+
+    subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-", str(path)],
+        check=True,
+    )
+    lsregister = (
+        "/System/Library/Frameworks/CoreServices.framework"
+        "/Versions/A/Frameworks/LaunchServices.framework"
+        "/Versions/A/Support/lsregister"
+    )
+    subprocess.run([lsregister, "-f", str(path)], check=True)
 
 
 def register_protocol_handler_macos() -> None:
-    try:
-        _register_protocol_handler_macos("net.ankiweb.dtop")
-    except Exception as e:
-        print(f"Failed to register macOS protocol handler: {e}")
+    helper_path = _macos_helper_app_path()
+    _create_macos_helper_app(helper_path, _macos_anki_bundle_identifier())
+    _set_macos_protocol_handler(helper_path)
 
 
 def unregister_protocol_handler_macos() -> None:
-    try:
-        _register_protocol_handler_macos("")
-    except Exception as e:
-        print(f"Failed to unregister macOS protocol handler: {e}")
+    _set_macos_protocol_handler_legacy(None)
 
 
 def unregister_protocol_handler_windows() -> None:

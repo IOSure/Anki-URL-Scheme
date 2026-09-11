@@ -1,3 +1,4 @@
-from ankiutils.consts import get_consts
+from types import SimpleNamespace
 
-consts = get_consts(__name__)
+
+consts = SimpleNamespace(name="Anki Links")

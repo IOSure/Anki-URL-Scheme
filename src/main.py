@@ -1,10 +1,7 @@
-import os
-import sys
+from typing import Optional
 
 from aqt import mw
-from aqt.qt import *
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "vendor"))
+from aqt.qt import QAction, QMenu, qconnect
 
 from .consts import consts
 from .handler import CommandHandler
@@ -44,13 +41,14 @@ def add_menu() -> None:
     mw.form.menuTools.addMenu(menu)
 
 
+_handler: Optional[CommandHandler] = None
+
+
 def init() -> None:
-    print("init")
-    handler = CommandHandler()
-    handler.start()
-    print("handler thread started")
+    global _handler
+    _handler = CommandHandler()
+    _handler.start()
     setup_app_hook()
-    print("Hooks set up")
     add_menu()
 
 
